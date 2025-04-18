@@ -3,27 +3,104 @@ import ora from "ora";
 import * as chromeLauncher from "chrome-launcher";
 // @ts-ignore - No type definitions available
 import CDP from "chrome-remote-interface";
-import { saveSession, saveHeaders } from "../utils/session.js";
+import {
+  saveSession,
+  saveHeaders,
+  saveSessionToCurrentDir,
+  saveHeadersToCurrentDir,
+} from "../utils/session.js";
 import { SessionData, Cookie } from "../types/index.js";
+import { execSync } from "child_process";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 
 const CHATGPT_URL = "https://chat.openai.com/auth/login";
 const CHAT_URL = "https://chat.openai.com/";
 
-export async function login(): Promise<void> {
-  let spinner = ora("Preparing to launch Chrome...").start();
-
+// Function to find Chrome debugging ports from running Chrome instances
+async function findChromeDebuggingPorts(): Promise<number[]> {
   try {
-    // Launch Chrome with user profile
-    spinner.text = "Launching Chrome browser...";
+    // Different commands for different platforms
+    let cmd = "";
+    if (process.platform === "darwin") {
+      // macOS
+      cmd =
+        'ps -ax | grep "Google Chrome" | grep "remote-debugging-port" | grep -v grep';
+    } else if (process.platform === "linux") {
+      cmd =
+        'ps -ax | grep "chrome" | grep "remote-debugging-port" | grep -v grep';
+    } else if (process.platform === "win32") {
+      cmd =
+        'wmic process where "name=\'chrome.exe\'" get commandline | findstr "remote-debugging-port"';
+    } else {
+      return []; // Unsupported platform
+    }
 
-    // Launch Chrome with the user's default profile
-    const chrome = await chromeLauncher.launch({
-      startingUrl: "about:blank", // Start with a blank page, we'll navigate later
-      chromeFlags: ["--disable-extensions"],
-      userDataDir: undefined, // Use default user profile
+    // Execute the command
+    const output = execSync(cmd, { encoding: "utf8" });
+
+    // Parse the output to find debugging ports
+    const ports: number[] = [];
+    const regex = /--remote-debugging-port=(\d+)/;
+
+    output.split("\n").forEach((line) => {
+      const match = line.match(regex);
+      if (match && match[1]) {
+        const port = parseInt(match[1], 10);
+        if (!isNaN(port)) {
+          ports.push(port);
+        }
+      }
     });
 
-    console.log(chalk.dim(`Chrome launched on debugging port ${chrome.port}`));
+    return ports;
+  } catch (error) {
+    // If the command fails or no Chrome instances are found
+    return [];
+  }
+}
+
+export async function login(): Promise<void> {
+  let spinner = ora("Preparing to connect to Chrome...").start();
+
+  try {
+    // Try to find existing Chrome instances
+    spinner.text = "Looking for existing Chrome instances...";
+    const existingPorts = await findChromeDebuggingPorts();
+
+    let chrome;
+    let usingExistingChrome = false;
+
+    if (existingPorts.length > 0) {
+      // Use the first available Chrome instance
+      const port = existingPorts[0];
+      console.log(
+        chalk.green(`Found existing Chrome instance on port ${port}`)
+      );
+
+      // Create a dummy chrome object that won't kill the browser when we're done
+      chrome = {
+        port,
+        kill: () => Promise.resolve(), // Dummy kill function that does nothing
+      };
+      usingExistingChrome = true;
+    } else {
+      // No existing Chrome with debugging port, launch a new one
+      spinner.text =
+        "No existing Chrome with debugging port found. Launching new Chrome instance...";
+
+      // Launch Chrome with the user's default profile and a debugging port
+      chrome = await chromeLauncher.launch({
+        startingUrl: "about:blank", // Start with a blank page, we'll navigate later
+        chromeFlags: ["--disable-extensions"],
+        userDataDir: undefined, // Use default user profile
+      });
+
+      console.log(
+        chalk.dim(`Chrome launched on debugging port ${chrome.port}`)
+      );
+    }
 
     spinner.stop();
     console.log(
@@ -179,8 +256,8 @@ export async function login(): Promise<void> {
 
             // Check for essential cookies
             cookieStatus = {
-              hasSessionToken: allCookies.some(
-                (c: any) => c.name === "__Secure-next-auth.session-token"
+              hasSessionToken: allCookies.some((c: any) =>
+                c.name.startsWith("__Secure-next-auth.session-token")
               ),
               hasPuid: allCookies.some((c: any) => c.name === "_puid"),
               hasCfClearance: allCookies.some(
@@ -214,23 +291,33 @@ export async function login(): Promise<void> {
           chalk.dim(`CF clearance cookie: ${cookieStatus.hasCfClearance}`)
         );
 
-        // Check if we're truly logged in - must have user menu or chat elements AND essential cookies
-        const hasEssentialCookies =
-          cookieStatus.hasSessionToken && cookieStatus.hasPuid;
+        // Check if we're truly logged in - must have user menu or chat elements AND at least some essential cookies
+        // We'll be more flexible about which cookies are required
+        const hasSessionToken = cookieStatus.hasSessionToken;
+        const hasPuidOrClearance =
+          cookieStatus.hasPuid || cookieStatus.hasCfClearance;
+        const hasEssentialCookies = hasSessionToken && hasPuidOrClearance;
+
+        // Also check if we're on a chat conversation page, which is a strong indicator of being logged in
+        const isOnChatPage =
+          currentUrl.includes("/c/") || currentUrl.includes("/chat/");
+
         const hasLoginUI =
           hasUserMenu.result.value === true ||
           hasChatElements.result.value === true;
 
-        // We're logged in if we're on a ChatGPT domain and have both UI elements and cookies
+        // We're logged in if we're on a ChatGPT domain and meet certain conditions
         if (
-          // On a chat conversation page with essential cookies
-          ((currentUrl.includes("/c/") || currentUrl.includes("/chat/")) &&
-            hasEssentialCookies &&
+          // On a chat conversation page with some cookies (very strong indicator of being logged in)
+          (isOnChatPage &&
+            (hasSessionToken || hasPuidOrClearance) &&
             isChatGPTDomain) ||
           // On the main chat page with essential cookies
           (isChatGPTDomain && !isLoginPage && hasEssentialCookies) ||
-          // Has UI elements and cookies and not on login page
-          (hasLoginUI && hasEssentialCookies && !isLoginPage && isChatGPTDomain)
+          // Has UI elements and some cookies and not on login page
+          (hasLoginUI && hasSessionToken && !isLoginPage && isChatGPTDomain) ||
+          // Special case: On a chat page with chat elements (very strong indicator of being logged in)
+          (isOnChatPage && hasLoginUI && isChatGPTDomain)
         ) {
           console.log(
             chalk.green("Login detected! You've successfully logged in.")
@@ -247,7 +334,9 @@ export async function login(): Promise<void> {
     }
 
     if (!isLoggedIn) {
-      chrome.kill();
+      if (!usingExistingChrome) {
+        chrome.kill();
+      }
       throw new Error("Login timed out after 5 minutes. Please try again.");
     }
 
@@ -269,6 +358,9 @@ export async function login(): Promise<void> {
         // Navigate to the chat page if we're not on it
         await Page.navigate({ url: CHAT_URL });
         await Page.loadEventFired();
+
+        // Wait a bit to ensure cookies are set properly
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     } catch (error: any) {
       console.log(
@@ -279,20 +371,95 @@ export async function login(): Promise<void> {
       // Continue anyway, we'll try to get the cookies
     }
 
-    // Get cookies - with retry mechanism
+    // Get cookies - with enhanced retry mechanism
     let cookiesResult;
     let retryCount = 0;
-    const maxRetries = 3;
+    const maxRetries = 5; // Increased from 3 to 5
+
+    // Try different methods to get cookies
+    const getCookiesWithMethod = async (method: string) => {
+      console.log(chalk.dim(`Trying to get cookies using ${method}...`));
+      try {
+        if (method === "getAllCookies") {
+          return await Network.getAllCookies();
+        } else if (method === "getCookies") {
+          // Try with specific domain
+          return await Network.getCookies({
+            urls: ["https://chat.openai.com/", "https://chatgpt.com/"],
+          });
+        } else if (method === "document.cookie") {
+          // Try with JavaScript
+          const docCookieResult = await Runtime.evaluate({
+            expression: `
+              (function() {
+                return document.cookie;
+              })()
+            `,
+          });
+
+          if (docCookieResult.result.value) {
+            // Parse document.cookie string into cookie objects
+            const cookieStr = docCookieResult.result.value;
+            console.log(
+              chalk.dim(`Got document.cookie: ${cookieStr.substring(0, 50)}...`)
+            );
+            // This won't have HttpOnly cookies, but we'll combine with other methods
+            return { cookies: [] };
+          }
+        }
+        return null;
+      } catch (error: any) {
+        console.log(
+          chalk.dim(
+            `Error getting cookies with ${method}: ${
+              error.message || "Unknown error"
+            }`
+          )
+        );
+        return null;
+      }
+    };
 
     while (retryCount < maxRetries) {
       try {
-        cookiesResult = await Network.getAllCookies();
+        // Try different methods in sequence
+        cookiesResult = await getCookiesWithMethod("getAllCookies");
+
+        if (
+          !cookiesResult ||
+          !cookiesResult.cookies ||
+          cookiesResult.cookies.length === 0
+        ) {
+          cookiesResult = await getCookiesWithMethod("getCookies");
+        }
+
+        if (
+          !cookiesResult ||
+          !cookiesResult.cookies ||
+          cookiesResult.cookies.length === 0
+        ) {
+          await getCookiesWithMethod("document.cookie");
+          cookiesResult = await getCookiesWithMethod("getAllCookies"); // Try again after document.cookie
+        }
+
         if (
           cookiesResult &&
           cookiesResult.cookies &&
           cookiesResult.cookies.length > 0
         ) {
-          break; // Successfully got cookies
+          // Check if we have the session token cookie (including those with suffixes)
+          const hasSessionToken = cookiesResult.cookies.some((c: any) =>
+            c.name.startsWith("__Secure-next-auth.session-token")
+          );
+
+          if (hasSessionToken) {
+            console.log(chalk.dim("Found session token cookie!"));
+            break; // Successfully got cookies including session token
+          } else {
+            console.log(
+              chalk.dim("Got cookies but session token is missing. Retrying...")
+            );
+          }
         }
       } catch (error: any) {
         console.log(
@@ -309,7 +476,17 @@ export async function login(): Promise<void> {
         console.log(
           chalk.dim(`Retrying to get cookies (attempt ${retryCount + 1})...`)
         );
-        await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait before retrying
+        // Navigate to the chat page again to refresh cookies
+        try {
+          await Page.navigate({ url: CHAT_URL });
+          await Page.loadEventFired();
+          // Wait longer between retries
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        } catch (error: any) {
+          console.log(
+            chalk.dim(`Error navigating: ${error.message || "Unknown error"}`)
+          );
+        }
       }
     }
 
@@ -410,6 +587,8 @@ export async function login(): Promise<void> {
     // Check if we have the essential cookies
     const essentialCookies = [
       "__Secure-next-auth.session-token",
+      "__Secure-next-auth.session-token.0",
+      "__Secure-next-auth.session-token.1",
       "_puid",
       "cf_clearance",
     ];
@@ -417,11 +596,32 @@ export async function login(): Promise<void> {
       (name) => !cookies.some((cookie) => cookie.name === name)
     );
 
-    // Check for critical cookies that are absolutely required
-    const criticalCookies = ["__Secure-next-auth.session-token", "_puid"];
-    const missingCriticalCookies = criticalCookies.filter(
-      (name) => !cookies.some((cookie) => cookie.name === name)
+    // Check for authentication cookies
+    // We need at least one of these authentication cookies
+    const hasSessionToken = cookies.some((cookie) =>
+      cookie.name.startsWith("__Secure-next-auth.session-token")
     );
+    const hasPuid = cookies.some((cookie) => cookie.name === "_puid");
+    const hasCfClearance = cookies.some(
+      (cookie) => cookie.name === "cf_clearance"
+    );
+
+    // For your account, we'll consider having PUID and CF clearance as sufficient even without session token
+    const hasAuthCookies = hasSessionToken || (hasPuid && hasCfClearance);
+
+    // Create a list of missing cookies for error reporting
+    const missingCriticalCookies = [];
+    if (!hasAuthCookies) {
+      if (!hasSessionToken) {
+        missingCriticalCookies.push("__Secure-next-auth.session-token");
+      }
+      if (!hasPuid) {
+        missingCriticalCookies.push("_puid");
+      }
+      if (!hasCfClearance) {
+        missingCriticalCookies.push("cf_clearance");
+      }
+    }
 
     if (missingCriticalCookies.length > 0) {
       // If critical cookies are missing, we can't proceed
@@ -438,7 +638,9 @@ export async function login(): Promise<void> {
           "These cookies are required for authentication. Please try again and make sure you complete the login process."
         )
       );
-      chrome.kill();
+      if (!usingExistingChrome) {
+        chrome.kill();
+      }
       throw new Error("Login failed: Missing critical cookies");
     } else if (missingCookies.length > 0) {
       // Non-critical cookies missing - warn but continue
@@ -454,9 +656,98 @@ export async function login(): Promise<void> {
       console.log(chalk.green("All essential cookies captured successfully!"));
     }
 
+    // Filter cookies to only include essential ones and those from relevant domains
+    // This helps prevent the "Request Header Or Cookie Too Large" error
+    const relevantDomains = [
+      "chat.openai.com",
+      "chatgpt.com",
+      "openai.com",
+      "auth0.openai.com",
+      "auth.openai.com",
+      "cloudflare",
+    ];
+
+    const essentialCookieNames = [
+      "__Secure-next-auth.session-token",
+      "__Secure-next-auth.session-token.0",
+      "__Secure-next-auth.session-token.1",
+      "_puid",
+      "cf_clearance",
+      "__cf_bm", // Cloudflare bot management cookie
+      "oai-sc", // OpenAI session cookie
+      "__Secure-next-auth.callback-url",
+      "__Host-next-auth.csrf-token",
+      "oai-did",
+      "oai-gn",
+      "oai-hm",
+      "oai-hlib",
+      "oai-nav-state",
+      "oai-last-model",
+      "_uasid",
+      "_umsid",
+    ];
+
+    // First, prioritize the most important cookies
+    const criticalCookies = cookies.filter((cookie) =>
+      essentialCookieNames.includes(cookie.name)
+    );
+
+    // Then add cookies from relevant domains, but only if we don't already have too many cookies
+    let filteredCookies = [...criticalCookies];
+
+    // Only add domain-based cookies if we don't have too many critical cookies already
+    if (criticalCookies.length < 20) {
+      const domainCookies = cookies.filter(
+        (cookie) =>
+          !essentialCookieNames.includes(cookie.name) &&
+          relevantDomains.some((domain) => cookie.domain.includes(domain))
+      );
+
+      // Add domain cookies, but limit the total number to avoid header size issues
+      const remainingSlots = 30 - filteredCookies.length;
+      if (remainingSlots > 0 && domainCookies.length > 0) {
+        filteredCookies = [
+          ...filteredCookies,
+          ...domainCookies.slice(0, remainingSlots),
+        ];
+      }
+    }
+
+    console.log(
+      chalk.dim(
+        `Filtered cookies: ${filteredCookies.length} (from original ${cookies.length})`
+      )
+    );
+
+    // Check for Cloudflare cookies
+    const cfClearanceCookie = filteredCookies.find(
+      (c) => c.name === "cf_clearance"
+    );
+    const cfBmCookie = filteredCookies.find((c) => c.name === "__cf_bm");
+
+    if (!cfClearanceCookie) {
+      console.log(
+        chalk.yellow(
+          "Warning: Missing Cloudflare clearance cookie. This may cause issues with API access."
+        )
+      );
+    } else {
+      console.log(chalk.green("Found Cloudflare clearance cookie."));
+    }
+
+    if (!cfBmCookie) {
+      console.log(
+        chalk.dim(
+          "No Cloudflare bot management cookie found. This is optional."
+        )
+      );
+    } else {
+      console.log(chalk.dim("Found Cloudflare bot management cookie."));
+    }
+
     // Save session data
     const sessionData: SessionData = {
-      cookies,
+      cookies: filteredCookies,
       userAgent,
       accessToken,
     };
@@ -464,16 +755,27 @@ export async function login(): Promise<void> {
     saveSession(sessionData);
     saveHeaders(headers);
 
+    // Also save to current directory
+    saveSessionToCurrentDir(sessionData);
+    saveHeadersToCurrentDir(headers);
+
     // Log the cookies we captured (names only for security)
     console.log(
-      chalk.dim("Captured cookies: " + cookies.map((c) => c.name).join(", "))
+      chalk.dim(
+        "Captured cookies: " + filteredCookies.map((c) => c.name).join(", ")
+      )
     );
 
     spinner.succeed("Successfully logged in and saved session");
     console.log(chalk.green("\nYou can now use 'chatgpt' to start chatting!"));
 
-    // Close Chrome
-    chrome.kill();
+    // Close Chrome if we launched a new instance
+    if (!usingExistingChrome) {
+      console.log(chalk.dim("Closing Chrome instance..."));
+      chrome.kill();
+    } else {
+      console.log(chalk.dim("Leaving existing Chrome instance running..."));
+    }
   } catch (error: any) {
     if (spinner.isSpinning) {
       spinner.fail(`Login failed: ${error.message}`);

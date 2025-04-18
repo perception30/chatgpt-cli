@@ -1,0 +1,10 @@
+{
+  "Content-Type": "application/json",
+  "Accept": "text/event-stream",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-origin",
+  "Referer": "https://chatgpt.com/",
+  "Origin": "https://chatgpt.com"
+}
